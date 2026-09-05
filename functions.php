@@ -735,3 +735,12 @@ if ( file_exists( get_stylesheet_directory() . '/order-list-phone-column.php' ) 
 if ( file_exists( get_stylesheet_directory() . '/telegram-order-bot.php' ) ) {
     require_once get_stylesheet_directory() . '/telegram-order-bot.php';
 }
+
+
+// Telegram Status Bot (মডারেটর ফোন দিলে Steadfast স্ট্যাটাস দেখাবে)
+if ( file_exists( get_stylesheet_directory() . '/telegram-order-status-bot.php' ) ) {
+    require_once get_stylesheet_directory() . '/telegram-order-status-bot.php';
+}
+
+
+
