@@ -38,7 +38,7 @@ define('FITHOME_ORDER_BOT_DUPLICATE_WINDOW_HOURS', 48);
 // ⚠️ মডেলের নাম বদলানোর আগে নিশ্চিত হয়ে নাও কোনগুলো available:
 //    curl https://api.groq.com/openai/v1/models -H "Authorization: Bearer YOUR_KEY"
 // =========================================================================
-define('FITHOME_GROQ_API_KEY', 'apikey');
+define('FITHOME_GROQ_API_KEY', 'api_key');
 
 // ধাপ ১: প্রাইমারি — ছোট ও দ্রুত, তোমার মতো ছোট extraction টাস্কের জন্য যথেষ্ট
 define('FITHOME_GROQ_MODEL_PRIMARY', 'openai/gpt-oss-20b');
@@ -707,7 +707,12 @@ function fithome_parse_order_text($raw_text) {
 }
 
 // =========================================================================
-// 📋 ORDERS LIST — Telegram Source ব্যাজ (HPOS + Classic দুটোর জন্যই)
+// 📋 ORDERS LIST — Order Source ব্যাজ (HPOS + Classic দুটোর জন্যই)
+//
+// ✅ CHANGED: এখন তিনটা state দেখাতে পারে —
+//   📱 Messenger অর্ডার (মডারেটর নামসহ)
+//   A  Abandoned Lead থেকে অটো-কনভার্ট হওয়া অর্ডার (৩ মিনিট নিষ্ক্রিয়তার পর)
+//   —  স্বাভাবিক Website অর্ডার (কাস্টমার নিজে সাবমিট করেছে)
 // =========================================================================
 add_filter('manage_woocommerce_page_wc-orders_columns', 'fithome_add_telegram_source_column');
 add_filter('manage_edit-shop_order_columns', 'fithome_add_telegram_source_column');
@@ -740,6 +745,12 @@ function fithome_render_telegram_source_column_classic($column, $post_id) {
     }
 }
 function fithome_echo_telegram_badge($order) {
+    // [NEW] Abandoned Lead থেকে অটো-কনভার্ট হওয়া অর্ডার — CS কে বলে দিচ্ছে
+    // এই অর্ডারটা কাস্টমার নিজে সাবমিট করেনি, কল করে কনফার্ম করা দরকার
+    if ($order->get_meta('_fithome_auto_converted_from_abandoned') === 'yes') {
+        echo '<span style="background:#E64A19;color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;font-weight:700;">A</span>';
+        return;
+    }
     if ($order->get_meta('_created_via_telegram_bot') === 'yes') {
         $mod_name = $order->get_meta('_telegram_moderator_name');
         echo '<span style="background:#0088cc;color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;">📱 ' . esc_html($mod_name) . '</span>';

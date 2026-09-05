@@ -33,6 +33,9 @@ add_action( 'wp_enqueue_scripts', 'child_theme_configurator_css', 10 );
 if ( ! defined( 'FITHOME_PRODUCT_ID' ) )         define( 'FITHOME_PRODUCT_ID', 1905 );
 if ( ! defined( 'FITHOME_FREE_SHIP_MIN_QTY' ) )  define( 'FITHOME_FREE_SHIP_MIN_QTY', 2 );
 
+// [NEW] Abandoned lead — শেষ activity থেকে কতক্ষণ নিষ্ক্রিয় থাকলে অটো-অর্ডারে কনভার্ট হবে
+if ( ! defined( 'FITHOME_ABANDONED_AUTO_CONVERT_DELAY' ) ) define( 'FITHOME_ABANDONED_AUTO_CONVERT_DELAY', 3 * MINUTE_IN_SECONDS );
+
 /**
  * অনুমোদিত প্যাকেজ ও তাদের মোট দাম (whitelist)।
  * এখানে না থাকলে সেই qty গ্রহণই করা হবে না।
@@ -211,12 +214,27 @@ function fit_home_save_abandoned_cart_data() {
             'post_type'     => 'abandoned_lead'
         );
         wp_insert_post($lead_data);
-        wp_send_json_success('Lead saved successfully!');
     } else {
         wp_update_post(array(
             'ID'           => $existing_leads[0]->ID,
             'post_content' => $content
         ));
+    }
+
+    // =====================================================================
+    // [NEW] Auto-Convert Scheduling — কাস্টমারের শেষ activity (phone/name/
+    // address এর যেকোনো blur) থেকে FITHOME_ABANDONED_AUTO_CONVERT_DELAY
+    // (৩ মিনিট) নিষ্ক্রিয় থাকলে অর্ডার অটো-প্রসেস হয়ে যাবে। প্রতিটা blur-এ
+    // আগের শিডিউল বাতিল করে নতুন করে ৩ মিনিট পরের জন্য শিডিউল হচ্ছে — কাস্টমার
+    // সক্রিয়ভাবে ফর্ম ফিল করতে থাকলে (একের পর এক ফিল্ড ভরলে) টাইমার বারবার
+    // রিসেট হবে, শুধু পুরোপুরি ইনঅ্যাকটিভ/ফর্ম ছেড়ে চলে গেলেই কনভার্ট হবে।
+    // =====================================================================
+    wp_clear_scheduled_hook( 'fithome_auto_convert_lead_event', array( $phone ) );
+    wp_schedule_single_event( time() + FITHOME_ABANDONED_AUTO_CONVERT_DELAY, 'fithome_auto_convert_lead_event', array( $phone ) );
+
+    if (empty($existing_leads)) {
+        wp_send_json_success('Lead saved successfully!');
+    } else {
         wp_send_json_success('Lead updated successfully!');
     }
 }
@@ -227,6 +245,12 @@ function fit_home_cleanup_abandoned_lead($order_id, $order) {
     $billing_phone = $order->get_billing_phone();
 
     if (!empty($billing_phone)) {
+
+        // [NEW] কাস্টমার নিজে সাবমিট করলে (বা অন্য কোনোভাবে অর্ডার processing-এ গেলে)
+        // ওই ফোনের জন্য শিডিউল করা pending auto-convert ইভেন্ট বাতিল করে দেওয়া হচ্ছে,
+        // যাতে ৩ মিনিট পর ভুল করে দ্বিতীয় একটা ডুপ্লিকেট অর্ডার তৈরি না হয়।
+        wp_clear_scheduled_hook( 'fithome_auto_convert_lead_event', array( $billing_phone ) );
+
         $existing_leads = get_posts(array(
             'post_type'   => 'abandoned_lead',
             'title'       => $billing_phone,
@@ -345,7 +369,10 @@ function fit_home_render_abandoned_lead_columns($column, $post_id) {
 
     if ($column === 'abandoned_address') {
         $content = get_post_field('post_content', $post_id);
-        preg_match('/Address:\s*(.*)/', $content, $m);
+        // [FIX] আগে \s* গ্রীডি হয়ে address খালি থাকলে পরের লাইনের "Product ID: ..."
+        // কেও ধরে ফেলত (\s* newline-ও গিলে নেয়)। এখন ^/$ + /m দিয়ে শুধু এই
+        // লাইনের ভ্যালুই ধরা হচ্ছে।
+        preg_match('/^Address:\s?(.*)$/m', $content, $m);
         echo isset($m[1]) && trim($m[1]) !== '' ? esc_html(trim($m[1])) : '<span style="color:#aaa;">—</span>';
     }
 
@@ -362,7 +389,110 @@ function fit_home_render_abandoned_lead_columns($column, $post_id) {
     }
 }
 
-// (f) Lead কে real order এ convert করার লজিক
+// =========================================================================
+// [NEW] Reusable: Lead → Order কনভার্সন লজিক
+//
+// fit_home_process_convert_lead()-এর মূল কনভার্সন লজিক (প্রোডাক্ট/প্যাকেজ
+// প্রাইস/শিপিং চার্জ ক্যালকুলেশন + অর্ডার তৈরি) এখানে বের করে আনা হয়েছে,
+// যাতে Manual "1-Click Convert" এবং নতুন Auto-Convert (৩ মিনিট নিষ্ক্রিয়তা)
+// — দুটোই একই কোড ব্যবহার করে, duplicate লজিক এড়ানো যায়।
+//
+// সফল হলে WC_Order অবজেক্ট রিটার্ন করে, ব্যর্থ হলে false।
+// =========================================================================
+function fithome_convert_lead_to_order( $lead_id, $extra_meta = array(), $status_note = '' ) {
+
+    $lead = get_post( $lead_id );
+    if ( ! $lead || $lead->post_type !== 'abandoned_lead' ) {
+        return false;
+    }
+    if ( ! class_exists('WooCommerce') ) {
+        return false;
+    }
+
+    $phone   = $lead->post_title;
+    $content = $lead->post_content;
+
+    preg_match('/Customer Name:\s*(.*)/', $content, $name_match);
+    // [FIX] আগে \s* গ্রীডি হয়ে address খালি থাকলে পরের লাইনের "Product ID: ..."
+    // কেও ঠিকানা হিসেবে ধরে ফেলত। এখন ^/$ + /m দিয়ে শুধু এই লাইনের ভ্যালুই ধরা হচ্ছে।
+    preg_match('/^Address:\s?(.*)$/m', $content, $address_match);
+    preg_match('/Product ID:\s*(.*)/', $content, $pid_match);
+    preg_match('/Quantity:\s*(.*)/', $content, $qty_match);
+    preg_match('/Location:\s*(.*)/', $content, $loc_match);
+
+    $name         = isset($name_match[1])    ? trim($name_match[1])    : 'Unknown';
+    $address_line = isset($address_match[1]) ? trim($address_match[1]) : '';
+    $product_id   = isset($pid_match[1])     ? intval(trim($pid_match[1])) : FITHOME_PRODUCT_ID;
+    $qty          = isset($qty_match[1])     ? intval(trim($qty_match[1])) : 1;
+    $location     = isset($loc_match[1])     ? trim($loc_match[1])     : 'inside_dhaka';
+
+    if ( $product_id <= 0 ) {
+        $product_id = FITHOME_PRODUCT_ID;
+    }
+
+    // সঠিক প্যাকেজ প্রাইস — লিডে সেভ করা qty অনুযায়ী (২/৩ মাসের প্যাকেজ হলেও সঠিক দামে)
+    $package_price = fithome_get_package_price( $qty );
+    if ( ! $package_price ) {
+        $qty           = 1;
+        $package_price = fithome_get_package_price( 1 );
+    }
+
+    $rates = fithome_get_shipping_rates();
+    if ( ! isset( $rates[ $location ] ) ) {
+        $location = 'inside_dhaka';
+    }
+
+    $product = wc_get_product($product_id);
+    if ( ! $product ) {
+        return false;
+    }
+
+    $order = wc_create_order();
+
+    $order->add_product( $product, $qty, array(
+        'subtotal' => $package_price,
+        'total'    => $package_price,
+    ) );
+
+    $address = array(
+        'first_name' => $name,
+        'phone'      => $phone,
+        'address_1'  => $address_line,
+        'city'       => ( $location === 'inside_dhaka' ) ? 'Dhaka' : 'Outside Dhaka',
+        'country'    => 'BD'
+    );
+
+    $order->set_address($address, 'billing');
+    $order->set_address($address, 'shipping');
+
+    // ডেলিভারি চার্জ যোগ করা
+    $shipping_charge = fithome_calc_shipping( $qty, $location );
+    if ( $shipping_charge > 0 ) {
+        $item_fee = new WC_Order_Item_Fee();
+        $item_fee->set_name('ডেলিভারি চার্জ');
+        $item_fee->set_amount($shipping_charge);
+        $item_fee->set_total($shipping_charge);
+        $order->add_item($item_fee);
+    }
+
+    $order->set_payment_method('cod');
+    $order->set_payment_method_title('Cash on delivery');
+
+    // কলার-নির্দিষ্ট অতিরিক্ত মেটা (যেমন auto-convert ফ্ল্যাগ) বসানো
+    foreach ( $extra_meta as $meta_key => $meta_value ) {
+        $order->update_meta_data( $meta_key, $meta_value );
+    }
+
+    $order->calculate_totals();
+    $order->save();
+    $order->update_status( 'processing', $status_note, true );
+
+    wp_delete_post( $lead_id, true );
+
+    return $order;
+}
+
+// (f) Lead কে real order এ convert করার লজিক (Manual 1-Click Convert বাটন)
 add_action('admin_post_convert_abandoned_lead', 'fit_home_process_convert_lead');
 function fit_home_process_convert_lead() {
 
@@ -387,78 +517,11 @@ function fit_home_process_convert_lead() {
         wp_die('WooCommerce is not active.');
     }
 
-    $phone   = $lead->post_title;
-    $content = $lead->post_content;
+    $order = fithome_convert_lead_to_order( $post_id, array(), 'Converted from Abandoned Lead via 1-Click Action.' );
 
-    preg_match('/Customer Name:\s*(.*)/', $content, $name_match);
-    preg_match('/Address:\s*(.*)/', $content, $address_match);
-    preg_match('/Product ID:\s*(.*)/', $content, $pid_match);
-    preg_match('/Quantity:\s*(.*)/', $content, $qty_match);
-    preg_match('/Location:\s*(.*)/', $content, $loc_match);
-
-    $name         = isset($name_match[1])    ? trim($name_match[1])    : 'Unknown';
-    $address_line = isset($address_match[1]) ? trim($address_match[1]) : '';
-    $product_id   = isset($pid_match[1])     ? intval(trim($pid_match[1])) : FITHOME_PRODUCT_ID;
-    $qty          = isset($qty_match[1])     ? intval(trim($qty_match[1])) : 1;
-    $location     = isset($loc_match[1])     ? trim($loc_match[1])     : 'inside_dhaka';
-
-    if ( $product_id <= 0 ) {
-        $product_id = FITHOME_PRODUCT_ID;
+    if ( ! $order ) {
+        wp_die('প্রোডাক্ট পাওয়া যায়নি অথবা লিড ইনভ্যালিড — কনভার্ট করা যায়নি।');
     }
-
-    // [FIX] আগে সবসময় qty=1 আর ডিফল্ট প্রোডাক্ট প্রাইসে অর্ডার হতো —
-    // ২/৩ মাসের প্যাকেজের লিড কনভার্ট করলে ভুল দাম ও ভুল পরিমাণে অর্ডার যেত
-    $package_price = fithome_get_package_price( $qty );
-    if ( ! $package_price ) {
-        $qty           = 1;
-        $package_price = fithome_get_package_price( 1 );
-    }
-
-    $rates = fithome_get_shipping_rates();
-    if ( ! isset( $rates[ $location ] ) ) {
-        $location = 'inside_dhaka';
-    }
-
-    $product = wc_get_product($product_id);
-    if ( ! $product ) {
-        wp_die('Product not found with ID: ' . esc_html( $product_id ));
-    }
-
-    $order = wc_create_order();
-
-    $order->add_product( $product, $qty, array(
-        'subtotal' => $package_price,
-        'total'    => $package_price,
-    ) );
-
-    $address = array(
-        'first_name' => $name,
-        'phone'      => $phone,
-        'address_1'  => $address_line,
-        'city'       => ( $location === 'inside_dhaka' ) ? 'Dhaka' : 'Outside Dhaka',
-        'country'    => 'BD'
-    );
-
-    $order->set_address($address, 'billing');
-    $order->set_address($address, 'shipping');
-
-    // [FIX] ডেলিভারি চার্জও যোগ হচ্ছে (আগে একদমই যোগ হতো না)
-    $shipping_charge = fithome_calc_shipping( $qty, $location );
-    if ( $shipping_charge > 0 ) {
-        $item_fee = new WC_Order_Item_Fee();
-        $item_fee->set_name('ডেলিভারি চার্জ');
-        $item_fee->set_amount($shipping_charge);
-        $item_fee->set_total($shipping_charge);
-        $order->add_item($item_fee);
-    }
-
-    $order->set_payment_method('cod');
-    $order->set_payment_method_title('Cash on delivery');
-    $order->calculate_totals();
-    $order->save();
-    $order->update_status('processing', 'Converted from Abandoned Lead via 1-Click Action.', true);
-
-    wp_delete_post($post_id, true);
 
     wp_redirect(admin_url('edit.php?post_type=abandoned_lead&converted=true'));
     exit;
@@ -470,6 +533,60 @@ function fit_home_converted_success_notice() {
     if (isset($_GET['converted']) && $_GET['converted'] == 'true') {
         echo '<div class="notice notice-success is-dismissible" style="border-left-color: #1B4D3E;"><p><strong>Success!</strong> Abandoned lead has been successfully converted into an order. You can view the details in WooCommerce -> Orders.</p></div>';
     }
+}
+
+
+// =========================================================================
+// [NEW] 3.1 Abandoned Lead — Auto-Convert (৩ মিনিট নিষ্ক্রিয়তার পর)
+//
+// fit_home_save_abandoned_cart_data()-এ শিডিউল করা ইভেন্ট এখানে হ্যান্ডল
+// হয়। কাস্টমার শেষ কোন field (phone/name/address) blur করার ৩ মিনিট পরেও
+// যদি নিজে অর্ডার সাবমিট না করে থাকে, তাহলে সেই লিডটা স্বয়ংক্রিয়ভাবে একটা
+// রিয়েল WooCommerce অর্ডারে (status: processing) কনভার্ট হয়ে যাবে —
+// existing SMS ও Telegram Bot 1 নোটিফিকেশন হুক নিজে থেকেই ফায়ার করবে,
+// এখানে আলাদা করে কিছু পাঠানোর দরকার নেই।
+// =========================================================================
+add_action('fithome_auto_convert_lead_event', 'fithome_auto_convert_abandoned_lead', 10, 1);
+function fithome_auto_convert_abandoned_lead($phone) {
+
+    $existing_leads = get_posts(array(
+        'post_type'   => 'abandoned_lead',
+        'title'       => $phone,
+        'post_status' => 'publish',
+        'numberposts' => 1
+    ));
+
+    // লিড না থাকলে মানে কাস্টমার ততক্ষণে নিজেই অর্ডার সাবমিট করে ফেলেছে
+    // (fit_home_cleanup_abandoned_lead ডিলিট করে দিয়েছে), অথবা লিড অটো-ক্লিনআপে
+    // মুছে গেছে — কোনো ক্ষেত্রেই এখানে আর কিছু করার নেই, চুপচাপ স্কিপ।
+    if (empty($existing_leads)) {
+        return;
+    }
+
+    $lead_content = $existing_leads[0]->post_content;
+
+    // [NEW] নাম আর ঠিকানা — দুটোই real value থাকলে তবেই auto-convert হবে।
+    // নাম না দিলে "Unknown" হিসেবে সেভ হয় (fit_home_save_abandoned_cart_data
+    // দেখুন), আর ঠিকানা খালি রেখে গেলে deliver করা অসম্ভব — এই দুই ক্ষেত্রেই
+    // লিড লিস্টে পড়ে থাকবে, admin ম্যানুয়ালি ফোন করে তথ্য নিয়ে convert করতে পারবেন।
+    preg_match('/^Customer Name:\s?(.*)$/m', $lead_content, $name_check);
+    preg_match('/^Address:\s?(.*)$/m', $lead_content, $addr_check);
+
+    $name_value = isset($name_check[1]) ? trim($name_check[1]) : '';
+    $addr_value = isset($addr_check[1]) ? trim($addr_check[1]) : '';
+
+    if ( $name_value === '' || strtolower($name_value) === 'unknown' ) {
+        return;
+    }
+    if ( mb_strlen($addr_value) < 5 ) {
+        return;
+    }
+
+    fithome_convert_lead_to_order(
+        $existing_leads[0]->ID,
+        array( '_fithome_auto_converted_from_abandoned' => 'yes' ),
+        'Auto-converted from Abandoned Lead after 3 minutes of inactivity.'
+    );
 }
 
 
