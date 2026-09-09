@@ -38,7 +38,7 @@ define('FITHOME_ORDER_BOT_DUPLICATE_WINDOW_HOURS', 48);
 // ⚠️ মডেলের নাম বদলানোর আগে নিশ্চিত হয়ে নাও কোনগুলো available:
 //    curl https://api.groq.com/openai/v1/models -H "Authorization: Bearer YOUR_KEY"
 // =========================================================================
-define('FITHOME_GROQ_API_KEY', 'api_key');
+define('FITHOME_GROQ_API_KEY', 'add api key nextj');
 
 // ধাপ ১: প্রাইমারি — ছোট ও দ্রুত, তোমার মতো ছোট extraction টাস্কের জন্য যথেষ্ট
 define('FITHOME_GROQ_MODEL_PRIMARY', 'openai/gpt-oss-20b');
