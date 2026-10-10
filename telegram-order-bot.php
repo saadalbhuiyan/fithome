@@ -38,7 +38,7 @@ define('FITHOME_ORDER_BOT_DUPLICATE_WINDOW_HOURS', 48);
 // ⚠️ মডেলের নাম বদলানোর আগে নিশ্চিত হয়ে নাও কোনগুলো available:
 //    curl https://api.groq.com/openai/v1/models -H "Authorization: Bearer YOUR_KEY"
 // =========================================================================
-define('FITHOME_GROQ_API_KEY', 'add api key nextj');
+define('FITHOME_GROQ_API_KEY', 'grokapikeyherej');
 
 // ধাপ ১: প্রাইমারি — ছোট ও দ্রুত, তোমার মতো ছোট extraction টাস্কের জন্য যথেষ্ট
 define('FITHOME_GROQ_MODEL_PRIMARY', 'openai/gpt-oss-20b');
@@ -286,6 +286,37 @@ function fithome_build_duplicate_warning_line($order) {
 }
 
 // =========================================================================
+// ✅ NEW: কাস্টম তারিখ-রেঞ্জ টেক্সট পার্স করা — ফরম্যাট DD/MM/YYYY-DD/MM/YYYY
+// (বাংলা সংখ্যা হ্যান্ডেল করে, হাইফেনের চারপাশে স্পেস থাকলেও চলবে)। ভ্যালিড
+// হলে array($start_ymd, $end_ymd) রিটার্ন করে, নাহলে false — শুরুর তারিখ
+// শেষের পরে হলে দুটো নিজে থেকেই অদলবদল করে নেয়।
+// =========================================================================
+function fithome_order_bot_parse_date_range($text) {
+    $text = fithome_normalize_bangla_digits(trim($text));
+
+    if (!preg_match('/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s*-\s*(\d{1,2})\/(\d{1,2})\/(\d{4})$/', $text, $m)) {
+        return false;
+    }
+
+    $start_d = intval($m[1]); $start_m = intval($m[2]); $start_y = intval($m[3]);
+    $end_d   = intval($m[4]); $end_m   = intval($m[5]); $end_y   = intval($m[6]);
+
+    if (!checkdate($start_m, $start_d, $start_y) || !checkdate($end_m, $end_d, $end_y)) {
+        return false;
+    }
+
+    $start_ymd = sprintf('%04d-%02d-%02d', $start_y, $start_m, $start_d);
+    $end_ymd   = sprintf('%04d-%02d-%02d', $end_y, $end_m, $end_d);
+
+    // শুরুর তারিখ শেষের পরে হলে দুটো অদলবদল করে দেওয়া হচ্ছে
+    if ($start_ymd > $end_ymd) {
+        list($start_ymd, $end_ymd) = array($end_ymd, $start_ymd);
+    }
+
+    return array($start_ymd, $end_ymd);
+}
+
+// =========================================================================
 // 🌐 WEBHOOK ENDPOINT REGISTRATION
 // =========================================================================
 add_action('rest_api_init', 'fithome_register_order_bot_webhook');
@@ -320,13 +351,25 @@ function fithome_order_bot_webhook_handler($request) {
         return new WP_REST_Response('Order Confirmed', 200);
     }
 
-    // ২. স্ট্যাটস কমান্ড (/daily, /weekly, /monthly, /N)
+    // ২. স্ট্যাটস কমান্ড (/daily, /weekly, /monthly, /N, /order, /command)
     if (strpos($text, '/') === 0) {
         fithome_order_bot_handle_stats_command($text, $chat_id, $moderator_name);
         return new WP_REST_Response('Stats Sent', 200);
     }
 
-    // ৩. নতুন অর্ডার টেক্সট → extract করে প্রিভিউ পাঠানো
+    // ✅ NEW: ৩. কাস্টম তারিখ-রেঞ্জ রিপোর্ট (DD/MM/YYYY-DD/MM/YYYY লিখে পাঠালে)
+    $date_range = fithome_order_bot_parse_date_range($text);
+    if ($date_range !== false) {
+        list($range_start, $range_end) = $date_range;
+        $report = fithome_order_bot_build_daterange_report($range_start, $range_end);
+        fithome_order_bot_send_message(
+            $chat_id,
+            $report !== '' ? $report : "⚠️ কোনো মডারেটর যোগ করা নেই।"
+        );
+        return new WP_REST_Response('Date Range Report Sent', 200);
+    }
+
+    // ৪. নতুন অর্ডার টেক্সট → extract করে প্রিভিউ পাঠানো
     // (প্রাইমারি মডেল → ব্যাকআপ মডেল → regex fallback)
     $parsed = fithome_extract_order_data_smart($text);
 
